@@ -1,0 +1,20 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Vercel local config
+.vercel/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Optional OS files
+.DS_Store
+Thumbs.db
+
+# VSCode settings (optional)
+.vscode/

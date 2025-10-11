@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Test Gemini Server</title>
+</head>
+<body>
+  <h1>Gemini Server Test</h1>
+  <pre id="output"></pre>
+
+  <script>
+    const output = document.getElementById("output");
+
+    fetch("http://localhost:3000/ask-gemini", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt: {
+          contents: [
+            { role: "user", parts: [{ text: "Hello world" }] }
+          ]
+        }
+      })
+    })
+    .then(res => res.json())
+    .then(data => output.textContent = JSON.stringify(data, null, 2))
+    .catch(err => output.textContent = "Error: " + err);
+  </script>
+</body>
+</html>
