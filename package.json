@@ -1,11 +1,15 @@
 {
-  "name": "my-gemini-server",
+  "name": "project-server",
   "version": "1.0.0",
   "type": "module",
-  "scripts": {
-    "start": "node server.js"
+  "engines": {
+    "node": ">=18"
   },
-   "dependencies": {
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
     "express": "^4.18.2",
     "googleapis": "^128.0.0",
     "node-fetch": "^3.3.2",
