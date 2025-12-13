@@ -1,4 +1,4 @@
-// server.js - UPDATED WITH GOOGLE CALENDAR INTEGRATION
+// server.js - Complete Vercel-Compatible Server with Calendar
 import express from 'express';
 import fetch from 'node-fetch';
 import cors from 'cors';
@@ -7,49 +7,118 @@ import { google } from 'googleapis';
 
 const app = express();
 
-// CORS configuration - allow all origins for Chrome extension
+// CORS configuration
 app.use(cors({
   origin: '*',
   methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type']
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
+// Environment variables
 const API_KEY = process.env.GOOGLE_API_KEY;
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = process.env.VERCEL_URL 
+  ? `https://${process.env.VERCEL_URL}/oauth2callback`
+  : 'http://localhost:3000/oauth2callback';
 
-// --- NEW: Google Calendar Configuration ---
+// Store tokens (in production, use database)
+const userTokens = new Map();
+
+// OAuth2 setup
 const SCOPES = ['https://www.googleapis.com/auth/calendar'];
-const userTokens = new Map(); // Simple in-memory token storage
-
 const oAuth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-  process.env.GOOGLE_REDIRECT_URI || 'http://localhost:3000/oauth2callback'
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REDIRECT_URI
 );
 
-// Health check endpoint
+// ============ HELPER FUNCTIONS ============
+
+// Parse natural language with Gemini
+async function parseScheduleRequest(userQuery) {
+  try {
+    const prompt = `Extract event details from: "${userQuery}"
+    
+    Return ONLY JSON with this structure:
+    {
+      "summary": "string (event title, default: 'Meeting')",
+      "startDateTime": "string (ISO 8601, e.g., 2025-01-15T14:00:00)",
+      "endDateTime": "string (ISO 8601, assume 1 hour if not specified)",
+      "attendees": ["email1@example.com", "email2@example.com"]
+    }
+    
+    Rules:
+    - If time not specified, assume in 1 hour from now
+    - If date not specified, use today
+    - If "tomorrow" mentioned, use tomorrow
+    - If "next week" mentioned, use next Monday at 9 AM
+    - Current time: ${new Date().toISOString()}`;
+    
+    const requestBody = {
+      contents: [{
+        parts: [{ text: prompt }]
+      }],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 300,
+      }
+    };
+    
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody)
+      }
+    );
+    
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
+    }
+    
+    const data = await response.json();
+    const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
+    
+    const jsonMatch = answer.match(/\{[\s\S]*\}/);
+    return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+    
+  } catch (error) {
+    console.error('❌ Error parsing schedule request:', error);
+    throw error;
+  }
+}
+
+// ============ ENDPOINTS ============
+
+// Health check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
-    message: 'Tab AI Server is running',
+    message: 'Tab AI Server with Calendar is running',
     endpoints: {
       ask: '/ask-gemini',
-      schedule: '/schedule-event',
-      auth: '/auth/url'
+      auth: '/auth/url',
+      schedule: '/schedule-event'
     },
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    deployment: process.env.VERCEL ? 'Vercel' : 'Local'
   });
 });
 
-// --- NEW: Authentication URL endpoint ---
+// 1. Get OAuth URL
 app.post('/auth/url', (req, res) => {
   try {
     const { userId } = req.body;
     
     if (!userId) {
       return res.status(400).json({ 
-        error: 'Missing required field: userId' 
+        error: 'User ID required',
+        example: 'Send {"userId": "unique_user_id_123"}' 
       });
     }
     
@@ -57,73 +126,130 @@ app.post('/auth/url', (req, res) => {
       access_type: 'offline',
       scope: SCOPES,
       prompt: 'consent',
-      state: userId
+      state: userId,
+      include_granted_scopes: true
     });
+    
+    console.log(`🔗 Generated auth URL for user: ${userId}`);
     
     res.json({ 
+      success: true,
       authUrl,
       userId,
-      message: 'Open this URL in browser to authenticate'
+      redirectUri: GOOGLE_REDIRECT_URI
     });
     
-  } catch (err) {
-    console.error('❌ Auth URL error:', err);
+  } catch (error) {
+    console.error('❌ Auth URL error:', error);
     res.status(500).json({ 
-      error: err.message,
-      details: 'Failed to generate auth URL'
+      error: 'Failed to generate auth URL',
+      details: error.message 
     });
   }
 });
 
-// --- NEW: OAuth callback endpoint ---
+// 2. OAuth callback (Google redirects here)
 app.get('/oauth2callback', async (req, res) => {
   try {
     const code = req.query.code;
     const userId = req.query.state;
     
-    if (!code || !userId) {
-      return res.status(400).send('Missing code or user ID');
+    if (!code) {
+      return res.status(400).send(`
+        <html><body>
+          <h2>Missing authorization code</h2>
+          <p>No code received from Google.</p>
+        </body></html>
+      `);
     }
+    
+    if (!userId) {
+      return res.status(400).send(`
+        <html><body>
+          <h2>Missing user ID</h2>
+          <p>No user ID found in state parameter.</p>
+        </body></html>
+      `);
+    }
+    
+    console.log(`🔄 Exchanging code for tokens for user: ${userId}`);
     
     const { tokens } = await oAuth2Client.getToken(code);
     userTokens.set(userId, tokens);
     
-    console.log(`✅ OAuth2 tokens received for user: ${userId}`);
+    console.log(`✅ Tokens received for user: ${userId}`);
     
-    // HTML page that communicates back to extension
     res.send(`
       <!DOCTYPE html>
       <html>
       <head>
         <title>Authentication Successful</title>
-        <script>
-          window.opener.postMessage({
-            type: 'oauth-callback',
-            success: true,
-            userId: '${userId}'
-          }, '*');
-          window.close();
-        </script>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 50px;
+            background: #f5f5f5;
+          }
+          .container {
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 500px;
+            margin: 0 auto;
+          }
+          .success {
+            color: #4CAF50;
+            font-size: 48px;
+            margin: 20px 0;
+          }
+        </style>
       </head>
       <body>
-        <p>Authentication successful! You can close this window.</p>
+        <div class="container">
+          <div class="success">✓</div>
+          <h2>Authentication Successful!</h2>
+          <p>You can now schedule events with your AI assistant.</p>
+          <p>This window will close automatically.</p>
+        </div>
+        <script>
+          // Send message to opener (Chrome extension)
+          if (window.opener) {
+            window.opener.postMessage({
+              type: 'oauth-callback',
+              success: true,
+              userId: '${userId}',
+              timestamp: new Date().toISOString()
+            }, '*');
+          }
+          
+          // Close after 1 second
+          setTimeout(() => {
+            window.close();
+          }, 1000);
+        </script>
       </body>
       </html>
     `);
     
-  } catch (err) {
-    console.error('❌ OAuth callback error:', err);
+  } catch (error) {
+    console.error('❌ OAuth callback error:', error);
+    
     res.status(500).send(`
       <!DOCTYPE html>
       <html>
-      <body>
-        <p>Authentication failed. Please try again.</p>
+      <body style="font-family: Arial; padding: 50px; text-align: center;">
+        <h2 style="color: #d32f2f;">Authentication Failed</h2>
+        <p>${error.message}</p>
         <script>
-          window.opener.postMessage({
-            type: 'oauth-callback',
-            success: false,
-            error: '${err.message}'
-          }, '*');
+          if (window.opener) {
+            window.opener.postMessage({
+              type: 'oauth-callback',
+              success: false,
+              error: 'Authentication failed: ${error.message.replace(/'/g, "\\'")}'
+            }, '*');
+          }
         </script>
       </body>
       </html>
@@ -131,71 +257,24 @@ app.get('/oauth2callback', async (req, res) => {
   }
 });
 
-// --- NEW: Helper to parse natural language with Gemini ---
-async function parseScheduleRequest(userQuery) {
-  const prompt = `
-  Extract event details from: "${userQuery}"
-  
-  Return ONLY JSON with this structure:
-  {
-    "summary": "string (event title)",
-    "startDateTime": "string (ISO 8601, e.g., 2025-01-15T14:00:00)",
-    "endDateTime": "string (ISO 8601, assume 1 hour if not specified)",
-    "attendees": ["email1@example.com", "email2@example.com"]
-  }
-  
-  Rules:
-  - If time not specified, assume in 1 hour
-  - If date not specified, use today
-  - If "tomorrow" mentioned, use tomorrow
-  - Default summary: "Meeting"
-  `;
-  
-  const requestBody = {
-    contents: [{
-      parts: [{ text: prompt }]
-    }],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 200,
-    }
-  };
-  
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody)
-    }
-  );
-  
-  if (!response.ok) {
-    const errorData = await response.text();
-    throw new Error(`Gemini parsing error: ${response.status} - ${errorData}`);
-  }
-  
-  const data = await response.json();
-  const answer = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
-  
-  // Extract JSON from response
-  const jsonMatch = answer.match(/\{[\s\S]*\}/);
-  return jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-}
-
-// --- NEW: Schedule event endpoint ---
+// 3. Schedule event endpoint
 app.post('/schedule-event', async (req, res) => {
   try {
     const { userQuery, userId } = req.body;
     
-    console.log('📅 Received schedule request:');
-    console.log('Query:', userQuery);
-    console.log('User ID:', userId);
+    console.log('📅 Schedule request:', { userQuery, userId });
     
-    // Validate inputs
-    if (!userQuery || !userId) {
+    if (!userQuery) {
       return res.status(400).json({ 
-        error: 'Missing required fields: userQuery and userId' 
+        error: 'Missing userQuery',
+        example: 'Schedule team meeting tomorrow at 3 PM' 
+      });
+    }
+    
+    if (!userId) {
+      return res.status(400).json({ 
+        error: 'Missing userId',
+        action: 'Call /auth/url first to authenticate' 
       });
     }
     
@@ -204,20 +283,21 @@ app.post('/schedule-event', async (req, res) => {
     if (!tokens) {
       return res.status(401).json({ 
         error: 'User not authenticated',
-        action: 'Call /auth/url first to get authentication URL'
+        action: 'authenticate',
+        endpoint: '/auth/url' 
       });
     }
     
     // Set up authenticated client
     const userAuth = new google.auth.OAuth2(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET,
-      process.env.GOOGLE_REDIRECT_URI
+      GOOGLE_CLIENT_ID,
+      GOOGLE_CLIENT_SECRET,
+      GOOGLE_REDIRECT_URI
     );
     userAuth.setCredentials(tokens);
     
-    // Parse natural language query
-    console.log('🤖 Parsing schedule request with Gemini...');
+    // Parse natural language
+    console.log('🤖 Parsing with Gemini...');
     const eventDetails = await parseScheduleRequest(userQuery);
     console.log('📝 Parsed details:', eventDetails);
     
@@ -226,6 +306,7 @@ app.post('/schedule-event', async (req, res) => {
     
     const event = {
       summary: eventDetails.summary || 'Meeting',
+      description: `Created via AI Assistant. Original query: "${userQuery}"`,
       start: {
         dateTime: eventDetails.startDateTime || new Date(Date.now() + 3600000).toISOString(),
         timeZone: 'UTC',
@@ -236,77 +317,90 @@ app.post('/schedule-event', async (req, res) => {
         timeZone: 'UTC',
       },
       attendees: eventDetails.attendees ? eventDetails.attendees.map(email => ({ email })) : [],
+      reminders: {
+        useDefault: true,
+      },
     };
     
-    console.log('📨 Creating calendar event...');
+    console.log('📨 Creating event:', event.summary);
+    
     const calendarResponse = await calendar.events.insert({
       calendarId: 'primary',
       resource: event,
+      sendUpdates: 'none',
     });
     
     console.log('✅ Event created:', calendarResponse.data.htmlLink);
     
-    res.json({ 
+    res.json({
       success: true,
-      message: `Event "${event.summary}" scheduled successfully!`,
-      eventLink: calendarResponse.data.htmlLink,
-      eventId: calendarResponse.data.id,
-      summary: event.summary,
-      startTime: event.start.dateTime,
-      endTime: event.end.dateTime
+      message: `✅ "${event.summary}" scheduled successfully!`,
+      event: {
+        id: calendarResponse.data.id,
+        link: calendarResponse.data.htmlLink,
+        summary: event.summary,
+        start: event.start.dateTime,
+        end: event.end.dateTime,
+      },
+      rawQuery: userQuery
     });
     
-  } catch (err) {
-    console.error('❌ Schedule error:', err);
+  } catch (error) {
+    console.error('❌ Schedule event error:', error);
     
-    // Handle expired tokens
-    if (err.message.includes('invalid_grant') || err.message.includes('token expired')) {
+    // Handle token errors
+    if (error.message.includes('invalid_grant') || error.message.includes('token expired')) {
       userTokens.delete(req.body.userId);
       return res.status(401).json({ 
         error: 'Authentication expired',
-        action: 'Re-authenticate via /auth/url'
+        action: 'reauthenticate',
+        endpoint: '/auth/url' 
+      });
+    }
+    
+    // Handle calendar permission errors
+    if (error.message.includes('insufficient permission')) {
+      return res.status(403).json({ 
+        error: 'Calendar access required',
+        action: 'Re-authenticate and grant calendar permissions' 
       });
     }
     
     res.status(500).json({ 
-      error: err.message,
-      details: 'Failed to schedule event'
+      error: 'Failed to schedule event',
+      details: error.message,
+      suggestion: 'Try: "Schedule meeting tomorrow at 3 PM for 1 hour"' 
     });
   }
 });
 
-// Main endpoint for Gemini queries (ORIGINAL - UNCHANGED)
+// 4. Original Gemini endpoint
 app.post('/ask-gemini', async (req, res) => {
   try {
-    // Extract request data
     const { question, tabsContext, maxTokens = 150, temperature = 0.5 } = req.body;
     
-    console.log('📥 Received Gemini request:');
-    console.log('Question:', question);
-    console.log('Tabs context length:', tabsContext?.length || 0);
+    console.log('📥 Gemini request:', { 
+      question: question?.substring(0, 100) + (question?.length > 100 ? '...' : ''),
+      contextLength: tabsContext?.length || 0 
+    });
     
-    // Validate inputs
     if (!question) {
       return res.status(400).json({ 
-        error: 'Missing required field: question' 
+        error: 'Missing question' 
       });
     }
     
     if (!API_KEY) {
       return res.status(500).json({ 
-        error: 'Google API key not configured' 
+        error: 'Gemini API key not configured' 
       });
     }
     
-    // Build the prompt for Gemini
     const fullPrompt = `${question}\n\nContext:\n${tabsContext || 'No context provided'}`;
     
-    // Correct Gemini API request format
     const requestBody = {
       contents: [{
-        parts: [{
-          text: fullPrompt
-        }]
+        parts: [{ text: fullPrompt }]
       }],
       generationConfig: {
         temperature: temperature,
@@ -316,21 +410,14 @@ app.post('/ask-gemini', async (req, res) => {
       }
     };
     
-    console.log('🌐 Calling Gemini API...');
-    
-    // Call Gemini API
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${API_KEY}`,
       {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json'
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody)
       }
     );
-    
-    console.log('📡 Gemini response status:', response.status);
     
     if (!response.ok) {
       const errorData = await response.text();
@@ -339,28 +426,19 @@ app.post('/ask-gemini', async (req, res) => {
     }
     
     const data = await response.json();
-    console.log('📦 Gemini raw response:', JSON.stringify(data, null, 2));
-    
-    // Extract the answer from Gemini's response
     let answer = '';
     
     if (data.candidates && data.candidates.length > 0) {
       const candidate = data.candidates[0];
-      
       if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
         answer = candidate.content.parts[0].text || '';
       }
     }
     
-    // Check if we got a valid answer
-    if (!answer || answer.trim().length === 0) {
-      console.warn('⚠️ Empty answer from Gemini');
+    if (!answer.trim()) {
       throw new Error('Gemini returned empty response');
     }
     
-    console.log('✅ Extracted answer:', answer);
-    
-    // Return the formatted response
     res.json({ 
       answer: answer.trim(),
       timestamp: new Date().toISOString(),
@@ -368,36 +446,57 @@ app.post('/ask-gemini', async (req, res) => {
     });
     
   } catch (err) {
-    console.error('❌ Server error:', err);
-    
+    console.error('❌ Gemini endpoint error:', err);
     res.status(500).json({ 
       error: err.message,
-      details: 'Failed to process request. Check server logs for details.'
+      details: 'Failed to process Gemini request'
     });
   }
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('❌ Unhandled error:', err);
-  res.status(500).json({ 
-    error: 'Internal server error',
-    message: err.message 
+// 5. Check authentication status
+app.get('/auth/status/:userId', (req, res) => {
+  const { userId } = req.params;
+  const isAuthenticated = userTokens.has(userId);
+  
+  res.json({
+    authenticated: isAuthenticated,
+    userId,
+    hasCalendarAccess: isAuthenticated,
+    timestamp: new Date().toISOString()
   });
 });
 
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log('🚀 Tab AI Server with Calendar started');
-  console.log(`📡 Listening on port ${PORT}`);
-  console.log(`🔑 Gemini API Key: ${API_KEY ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`👤 Google Client ID: ${process.env.GOOGLE_CLIENT_ID ? '✅ Configured' : '❌ Missing'}`);
-  console.log(`📍 Endpoints:`);
-  console.log(`   - http://localhost:${PORT}/ask-gemini`);
-  console.log(`   - http://localhost:${PORT}/auth/url`);
-  console.log(`   - http://localhost:${PORT}/schedule-event`);
-  console.log(`   - http://localhost:${PORT}/oauth2callback`);
+// Error handling
+app.use((err, req, res, next) => {
+  console.error('❌ Unhandled server error:', err);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: err.message,
+    timestamp: new Date().toISOString()
+  });
 });
 
+// Server startup - Vercel compatible
+const PORT = process.env.PORT || 3000;
+
+// Only start listening if NOT in Vercel serverless environment
+if (process.env.VERCEL !== '1') {
+  app.listen(PORT, () => {
+    console.log('🚀 Tab AI Server with Calendar started');
+    console.log(`📡 Port: ${PORT}`);
+    console.log(`🌐 Environment: ${process.env.VERCEL ? 'Vercel' : 'Local'}`);
+    console.log(`🔑 Gemini API: ${API_KEY ? '✅' : '❌'}`);
+    console.log(`👤 OAuth Client: ${GOOGLE_CLIENT_ID ? '✅' : '❌'}`);
+    console.log('');
+    console.log('📋 Available Endpoints:');
+    console.log(`   POST /auth/url     - Get OAuth URL`);
+    console.log(`   GET  /oauth2callback - OAuth callback`);
+    console.log(`   POST /schedule-event - Schedule events`);
+    console.log(`   POST /ask-gemini    - Ask Gemini`);
+    console.log(`   GET  /auth/status/:userId - Check auth`);
+  });
+}
+
+// Export for Vercel serverless
 export default app;
